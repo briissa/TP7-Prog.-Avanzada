@@ -1,0 +1,27 @@
+{
+  "name": "rutasur-eventos",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev web",
+    "build": "next build web",
+    "start": "next start web",
+    "test": "node --test",
+    "worker": "node src/services/workers.js",
+    "simulator": "node src/services/simulator.js",
+    "replay": "node src/services/replay.js",
+    "rebuild": "node src/services/rebuild.js"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4",
+    "mongodb": "^6.17.0",
+    "next": "^16.4.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "postcss": "^8.5.31"
+  }
+}

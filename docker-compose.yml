@@ -1,0 +1,199 @@
+x-node-app: &node-app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: rutasur-app:local
+
+x-app-env: &app-env
+  MONGO_URL: mongodb://mongo:27017/rutasur?replicaSet=rs0
+  KAFKA_BROKERS: kafka:9092
+  SIMULATION_SPEED: ${SIMULATION_SPEED:-120}
+  SHIPMENTS_PER_MINUTE: ${SHIPMENTS_PER_MINUTE:-20}
+
+x-simulator-env: &simulator-env
+  KAFKA_BROKERS: kafka:9092
+  SIMULATION_SPEED: ${SIMULATION_SPEED:-120}
+  SHIPMENTS_PER_MINUTE: ${SHIPMENTS_PER_MINUTE:-20}
+  SIMULATION_CLOCK_FILE: /data/simulation-clock.json
+
+services:
+  kafka:
+    image: apache/kafka:3.9.1
+    hostname: kafka
+    ports:
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: INTERNAL://:9092,EXTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mongo:
+    image: mongo:8
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - mongo-data:/data/db
+
+  mongo-init:
+    image: mongo:8
+    depends_on:
+      mongo:
+        condition: service_healthy
+    entrypoint:
+      - mongosh
+      - mongodb://mongo:27017/admin
+      - --quiet
+      - --eval
+      - "try { rs.status().ok } catch (_) { rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo:27017'}]}) }"
+    restart: "no"
+
+  topics:
+    image: apache/kafka:3.9.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-ec"]
+    command:
+      - |
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic envios.estados --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic envios.promesas --partitions 3 --replication-factor 1 --config cleanup.policy=compact
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic envios.reprogramaciones --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic alertas.sla --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic notificaciones.enviadas --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic envios.estados.dlq --partitions 3 --replication-factor 1 --config retention.ms=2592000000
+    restart: "no"
+
+  simulator:
+    <<: *node-app
+    command: ["node", "src/services/simulator.js"]
+    environment: *simulator-env
+    ports:
+      - "4000:4000"
+    volumes:
+      - simulator-clock:/data
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+
+  projector:
+    <<: *node-app
+    command: ["node", "src/services/workers.js", "projector"]
+    environment: *app-env
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  notifications:
+    <<: *node-app
+    command: ["node", "src/services/workers.js", "notifications"]
+    environment: *app-env
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  rescheduler:
+    <<: *node-app
+    command: ["node", "src/services/workers.js", "rescheduler"]
+    environment: *app-env
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  sla-monitor:
+    <<: *node-app
+    command: ["node", "src/services/workers.js", "sla-monitor"]
+    environment: *app-env
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  analytics:
+    <<: *node-app
+    command: ["node", "src/services/workers.js", "analytics"]
+    environment: *app-env
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  web:
+    <<: *node-app
+    command: ["npm", "run", "start"]
+    environment:
+      MONGO_URL: mongodb://mongo:27017/rutasur?replicaSet=rs0
+      KAFKA_BROKERS: kafka:9092
+      SIMULATOR_URL: http://simulator:4000
+      SIMULATION_SPEED: ${SIMULATION_SPEED:-120}
+    ports:
+      - "3100:3000"
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+      simulator:
+        condition: service_started
+    restart: unless-stopped
+
+  rebuild:
+    <<: *node-app
+    profiles: ["tools"]
+    command: ["node", "src/services/rebuild.js"]
+    environment: *app-env
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+
+  replay:
+    <<: *node-app
+    profiles: ["tools"]
+    command: ["node", "src/services/replay.js"]
+    environment: *app-env
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+      topics:
+        condition: service_completed_successfully
+
+volumes:
+  mongo-data:
+  simulator-clock:

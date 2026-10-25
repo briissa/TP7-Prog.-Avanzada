@@ -1,0 +1,6 @@
+node_modules/
+.next/
+coverage/
+.env
+.simulation-clock.json
+npm-debug.log*
